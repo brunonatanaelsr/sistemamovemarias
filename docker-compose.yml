@@ -1,0 +1,226 @@
+version: '3.8'
+
+services:
+  # ====================================
+  # Banco de Dados PostgreSQL
+  # ====================================
+  db:
+    image: postgres:15-alpine
+    container_name: movemarias_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: movemarias_db
+      POSTGRES_USER: movemarias_user
+      POSTGRES_PASSWORD: movemarias_password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=pt_BR.UTF-8 --lc-ctype=pt_BR.UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - movemarias_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U movemarias_user -d movemarias_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ====================================
+  # Backend Flask API
+  # ====================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: development
+    container_name: movemarias_backend
+    restart: unless-stopped
+    environment:
+      - FLASK_ENV=development
+      - FLASK_DEBUG=1
+      - DATABASE_URL=postgresql://movemarias_user:movemarias_password@db:5432/movemarias_db
+      - SECRET_KEY=dev-secret-key-change-in-production
+      - JWT_SECRET_KEY=jwt-secret-key-change-in-production
+      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+    volumes:
+      - ./backend:/app
+      - backend_uploads:/app/uploads
+      - backend_logs:/app/logs
+      - backend_temp:/app/temp
+    ports:
+      - "5000:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - movemarias_network
+    command: >
+      sh -c "
+        echo 'Aguardando banco de dados...' &&
+        python -c 'import time; time.sleep(10)' &&
+        echo 'Executando migrações...' &&
+        flask db upgrade &&
+        echo 'Criando dados iniciais...' &&
+        python seed_data.py &&
+        echo 'Iniciando aplicação Flask...' &&
+        flask run --host=0.0.0.0 --port=5000 --debug
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ====================================
+  # Frontend React
+  # ====================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: development
+    container_name: movemarias_frontend
+    restart: unless-stopped
+    environment:
+      - REACT_APP_API_URL=http://localhost:5000/api
+      - CHOKIDAR_USEPOLLING=true
+      - WATCHPACK_POLLING=true
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - frontend_build:/app/build
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - movemarias_network
+    command: npm start
+    stdin_open: true
+    tty: true
+
+  # ====================================
+  # Redis (para cache e sessões futuras)
+  # ====================================
+  redis:
+    image: redis:7-alpine
+    container_name: movemarias_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass movemarias_redis_password
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - movemarias_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ====================================
+  # pgAdmin (Interface para PostgreSQL)
+  # ====================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: movemarias_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@movemarias.dev
+      PGADMIN_DEFAULT_PASSWORD: admin123
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./database/pgadmin_servers.json:/pgadmin4/servers.json:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
+    networks:
+      - movemarias_network
+
+  # ====================================
+  # Nginx (Proxy Reverso para Produção)
+  # ====================================
+  nginx:
+    image: nginx:alpine
+    container_name: movemarias_nginx
+    restart: unless-stopped
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - frontend_build:/usr/share/nginx/html
+      - backend_uploads:/usr/share/nginx/html/uploads:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - movemarias_network
+    profiles:
+      - production
+
+  # ====================================
+  # Backup Service (Para backups automáticos)
+  # ====================================
+  backup:
+    image: postgres:15-alpine
+    container_name: movemarias_backup
+    restart: "no"
+    environment:
+      PGPASSWORD: movemarias_password
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup.sh:/backup.sh:ro
+    depends_on:
+      - db
+    networks:
+      - movemarias_network
+    command: >
+      sh -c "
+        apk add --no-cache dcron &&
+        echo '0 2 * * * /backup.sh' | crontab - &&
+        crond -f
+      "
+    profiles:
+      - production
+
+# ====================================
+# Volumes Persistentes
+# ====================================
+volumes:
+  postgres_data:
+    name: movemarias_postgres_data
+  redis_data:
+    name: movemarias_redis_data
+  pgadmin_data:
+    name: movemarias_pgadmin_data
+  backend_uploads:
+    name: movemarias_backend_uploads
+  backend_logs:
+    name: movemarias_backend_logs
+  backend_temp:
+    name: movemarias_backend_temp
+  frontend_build:
+    name: movemarias_frontend_build
+
+# ====================================
+# Rede Interna
+# ====================================
+networks:
+  movemarias_network:
+    name: movemarias_network
+    driver: bridge
+
+# ====================================
+# Configurações adicionais para desenvolvimento
+# ====================================
+x-development: &development
+  restart: "no"
+  
+x-production: &production
+  restart: unless-stopped
